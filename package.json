@@ -1,0 +1,15 @@
+{
+    "name": "satrack-sync",
+    "version": "1.0.0",
+    "private": true,
+    "description": "Sincroniza tickets de Airtable con Satrack (SendTrips + seguimiento de eventos) y guarda el resultado en Supabase.",
+    "type": "module",
+    "scripts": {
+        "sync": "node scripts/sync-satrack.mjs"
+    },
+    "dependencies": {
+        "@supabase/supabase-js": "^2.45.0",
+        "@turf/boolean-point-in-polygon": "^7.1.0",
+        "dotenv": "^16.4.5"
+    }
+}
