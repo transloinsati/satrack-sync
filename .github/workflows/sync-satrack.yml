@@ -9,10 +9,6 @@ on:
         description: "Id Ticket para acotar la corrida a uno solo (opcional)"
         required: false
 
-concurrency:
-  group: sync-satrack
-  cancel-in-progress: false
-
 jobs:
   sync:
     runs-on: ubuntu-latest
