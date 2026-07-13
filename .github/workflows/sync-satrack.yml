@@ -9,10 +9,14 @@ on:
         description: "Id Ticket para acotar la corrida a uno solo (opcional)"
         required: false
 
+concurrency:
+  group: sync-satrack
+  cancel-in-progress: false
+
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 4
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
 

@@ -12,6 +12,9 @@ const {
   SATRACK_CLIENT_ID,
   SATRACK_CLIENT_SECRET,
   SATRACK_GRANT_TYPE = "client_credentials",
+  // No confirmado todavia si el API de TMS (trafficcontrolintegrationapi.satrack.com) usa el mismo
+  // proveedor de identidad que el API de eventos de ubicacion (documentos_satrack/api_evento.md).
+  // Sobreescribir via env si Satrack confirma un host distinto para las credenciales de TMS.
   SATRACK_TOKEN_URL = "http://securityprovider.satrack.com:8080/auth/realms/satrack-base/protocol/openid-connect/token",
   SATRACK_API_BASE = "https://trafficcontrolintegrationapi.satrack.com",
   AIRTABLE_PAT,
@@ -72,8 +75,8 @@ const normalize = (s) =>
   (s || "").normalize("NFD").replace(/[̀-ͯ]/g, "").trim().toLowerCase();
 
 // Resuelve el Origen (lat/lng) de un ticket via RUC Cliente -> Clientes.Origen, desambiguando por
-// la ciudad de texto del ticket si el cliente tiene mas de un Origen vinculado. Tickets.Origen 2
-// (link directo) esta vacio en la practica — no usarlo.
+// la ciudad de texto del ticket si el cliente tiene mas de un Origen vinculado (ver plan: caso
+// Arcacontinental Duran/Quito). Tickets.Origen 2 (link directo) esta vacio en la practica — no usarlo.
 async function resolveOrigen(ticket) {
   const clienteLink = ticket.fields["RUC Cliente"]?.[0];
   if (!clienteLink) return { error: "Ticket sin RUC Cliente vinculado" };
@@ -123,10 +126,8 @@ async function resolveDestino(ticket) {
   return { destino, clienteDestino, lat: Latitud, lng: Longitud, direccion };
 }
 
-async function fetchAreasFor(clienteOrigenId, clienteDestinoId) {
-  const table = "Areas";
-  const records = await airtableListAll(table);
-  return records.filter((r) => {
+function areasFor(allAreas, clienteOrigenId, clienteDestinoId) {
+  return allAreas.filter((r) => {
     const co = r.fields["Cliente_Origen"]?.[0];
     const cd = r.fields["Cliente_Destino"]?.[0];
     return (clienteOrigenId && co === clienteOrigenId) || (clienteDestinoId && cd === clienteDestinoId);
@@ -169,7 +170,8 @@ function sendTrips(token, payload) {
 }
 
 // El schema de TripHistoryReportResposeModel describe UN solo objeto (no una lista) aunque el
-// request acepta un array de placas -> se asume una llamada por placa.
+// request acepta un array de placas -> se asume una llamada por placa (confirmar con una prueba
+// real de 2+ placas si algun dia se necesita procesar en lote).
 function getEventsForPlate(token, placa) {
   return satrackFetch(token, "/Trips/oauth/GetEventsOnRouteByVehicleFromBitacora", {
     method: "POST",
@@ -218,7 +220,8 @@ function buildPayload({ ticket, unidad, cliente, origen, destino, clienteDestino
   const fechaSolicitada = ticket.fields["Fecha Carga Solicitada"];
   const { date: creationDate, time } = ecuadorSplit(fechaSolicitada);
   // Ventanas de compromiso: no hay un campo dedicado en Airtable para esto todavia. Se usa un
-  // margen fijo (4h para carga, 24h para descarga) como placeholder razonable.
+  // margen fijo (4h para carga, 24h para descarga) como placeholder razonable — ajustar si
+  // Transloinsa define una regla de negocio real (ej. Cliente."Duración Máxima de Entrega").
   // Satrack valida server-side que CommitmentDateUpload no sea pasado -> anclar a "ahora", no a
   // Fecha Carga Solicitada (que para tickets ya en curso suele quedar en el pasado).
   const commitmentUpload = new Date(Date.now() + 4 * 60 * 60 * 1000);
@@ -276,7 +279,7 @@ function buildPayload({ ticket, unidad, cliente, origen, destino, clienteDestino
 
 async function pasada1CrearViajes(token) {
   // SYNC_ONLY_TICKET_ID: para probar contra un solo ticket real antes de correr contra todos los
-  // activos.
+  // activos (recomendado para la primera corrida manual, ver plan_automatizacion_satrack.md).
   const filterByFormula = process.env.SYNC_ONLY_TICKET_ID
     ? `{Id Ticket} = '${process.env.SYNC_ONLY_TICKET_ID}'`
     : "AND({Placa Unidad} != '', {Estado Ticket} != 'Cancelado')";
@@ -458,6 +461,10 @@ async function pasada2RevisarEtapas(token) {
     .eq("estado_envio", "enviado")
     .neq("zona_actual", "completado");
 
+  // Se trae Areas una sola vez por corrida (antes se re-listaba la tabla completa por cada viaje
+  // activo -> con varios viajes simultaneos eso solo ya se comia buena parte del timeout).
+  const allAreas = (viajesActivos ?? []).length ? await airtableListAll("Areas") : [];
+
   let ok = 0;
   let error = 0;
   const detalle = [];
@@ -480,7 +487,7 @@ async function pasada2RevisarEtapas(token) {
       const destinoRecord = destinoRecordId ? await airtableGetRecord("Destino", destinoRecordId) : null;
       const clienteDestinoId = destinoRecord?.fields["Cliente Destino"]?.[0];
 
-      const areas = await fetchAreasFor(clienteOrigenId, clienteDestinoId);
+      const areas = areasFor(allAreas, clienteOrigenId, clienteDestinoId);
       const zonaNueva = detectarZona(toFeature(coordinate), areas);
 
       if (zonaNueva !== viaje.zona_actual) {
