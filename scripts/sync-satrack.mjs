@@ -280,9 +280,12 @@ function buildPayload({ ticket, unidad, cliente, origen, destino, clienteDestino
 async function pasada1CrearViajes(token) {
   // SYNC_ONLY_TICKET_ID: para probar contra un solo ticket real antes de correr contra todos los
   // activos (recomendado para la primera corrida manual, ver plan_automatizacion_satrack.md).
+  // BUG real corregido (2026-07-13): "!= 'Cancelado'" tambien dejaba pasar tickets "Completo" --
+  // sin esto, cada corrida procesaba TODO el historial de tickets ya entregados de Transloinsa (no
+  // solo los de hoy), lo que agoto el timeout del workflow. Debe ser el mismo filtro que la Pasada 2.
   const filterByFormula = process.env.SYNC_ONLY_TICKET_ID
     ? `{Id Ticket} = '${process.env.SYNC_ONLY_TICKET_ID}'`
-    : "AND({Placa Unidad} != '', {Estado Ticket} != 'Cancelado')";
+    : "AND({Placa Unidad} != '', {Estado Ticket} = 'En proceso')";
   const tickets = await airtableListAll(TICKETS_TABLE, { filterByFormula });
 
   let ok = 0;
