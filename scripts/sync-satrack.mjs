@@ -2,7 +2,8 @@
 // GetEventsOnRouteByVehicleFromBitacora) <-> Supabase (viajes/etapas/log_sincronizacion, escritura).
 //
 // Uso local: node scripts/sync-satrack.mjs
-// Uso en GitHub Actions: mismo comando, variables de entorno vía secrets del repo.
+// Uso en cron (servidor Transloinsa / GitHub Actions): mismo comando, variables de entorno vía .env
+// o secrets del repo.
 
 import "dotenv/config";
 import { createClient } from "@supabase/supabase-js";
@@ -263,7 +264,9 @@ function buildPayload({ ticket, unidad, cliente, origen, destino, clienteDestino
         senderAddress: origen.direccion || "",
         senderLatitude: origen.lat,
         senderLongitude: origen.lng,
-        recipientName: clienteDestino?.fields["Razón Social"] || "",
+        // Satrack rechaza recipientName vacio (400) -- algunos Cliente Destino tienen la Razón
+        // Social sin llenar (solo RUC), usar el nombre de Destino."Cliente Entrega" como respaldo.
+        recipientName: clienteDestino?.fields["Razón Social"] || destino.destino.fields["Cliente Entrega"] || "Cliente",
         recipientAddress: destino.direccion || "",
         recipientLatitude: destino.lat,
         recipientLongitude: destino.lng,
@@ -434,17 +437,7 @@ const ZONA_TO_ETAPA = {
 };
 
 async function cerrarYAbrirEtapa(viajeId, ticketId, zonaNueva) {
-  const { data: abierta } = await supabase
-    .from("etapas")
-    .select("id")
-    .eq("viaje_id", viajeId)
-    .eq("estado_evento", "En Proceso")
-    .maybeSingle();
-
-  const ahora = new Date().toISOString();
-  if (abierta) {
-    await supabase.from("etapas").update({ fecha_fin: ahora, estado_evento: "Finalizado" }).eq("id", abierta.id);
-  }
+  await cerrarEtapaAbierta(viajeId);
 
   const etapaNombre = ZONA_TO_ETAPA[zonaNueva];
   if (!etapaNombre) return; // "sin_asignar" u otra zona sin etapa asociada
@@ -452,17 +445,42 @@ async function cerrarYAbrirEtapa(viajeId, ticketId, zonaNueva) {
     viaje_id: viajeId,
     ticket_id: ticketId,
     etapa: etapaNombre,
-    fecha_inicio: ahora,
+    fecha_inicio: new Date().toISOString(),
     estado_evento: "En Proceso",
   });
 }
+
+async function cerrarEtapaAbierta(viajeId) {
+  const { data: abierta } = await supabase
+    .from("etapas")
+    .select("id")
+    .eq("viaje_id", viajeId)
+    .eq("estado_evento", "En Proceso")
+    .maybeSingle();
+  if (abierta) {
+    await supabase
+      .from("etapas")
+      .update({ fecha_fin: new Date().toISOString(), estado_evento: "Finalizado" })
+      .eq("id", abierta.id);
+  }
+}
+
+// trip.status terminal de Satrack -> zona_actual final. FINISHED es una entrega real completada;
+// EXPIRED/CANCELLED son viajes que nunca se confirmaron o se cancelaron -- se marcan distinto
+// ("cancelado") para no confundirlos con una entrega real en reportes.
+const TRIP_STATUS_TERMINAL = {
+  FINISHED: "completado",
+  EXPIRED: "cancelado",
+  CANCELLED: "cancelado",
+  CANCELED: "cancelado",
+};
 
 async function pasada2RevisarEtapas(token) {
   const { data: viajesActivos } = await supabase
     .from("viajes")
     .select("*")
     .eq("estado_envio", "enviado")
-    .neq("zona_actual", "completado");
+    .not("zona_actual", "in", "(completado,cancelado)");
 
   // Se trae Areas una sola vez por corrida (antes se re-listaba la tabla completa por cada viaje
   // activo -> con varios viajes simultaneos eso solo ya se comia buena parte del timeout).
@@ -479,6 +497,14 @@ async function pasada2RevisarEtapas(token) {
 
       if (body.trip?.tripId && !viaje.satrack_trip_id) {
         await supabase.from("viajes").update({ satrack_trip_id: body.trip.tripId }).eq("id", viaje.id);
+      }
+
+      const zonaTerminal = TRIP_STATUS_TERMINAL[body.trip?.status];
+      if (zonaTerminal) {
+        await cerrarEtapaAbierta(viaje.id);
+        await supabase.from("viajes").update({ zona_actual: zonaTerminal }).eq("id", viaje.id);
+        ok++;
+        continue; // viaje terminado -- no tiene sentido seguir con deteccion de zona por coordenada
       }
 
       const coordinate = body.vehicleCurrentState?.coordinate;
