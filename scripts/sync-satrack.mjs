@@ -475,6 +475,27 @@ const ZONA_TO_ETAPA = {
   area_descarga: "Recepción de Mercadería",
 };
 
+// "Espera de Ruta" y "Fin de Entrega de Mercadería" no son zonas nuevas -- son la transicion de
+// salir de la sub-zona especifica (area_carga/area_descarga) pero seguir dentro de la zona general
+// (bodega_origen/bodega_destino). Con solo la zona actual no se puede distinguir "recien llegue a
+// bodega_origen" de "sali de area_carga y volvi a bodega_origen" (ambas dan zona_actual=
+// 'bodega_origen') -- hace falta la zona ANTERIOR para resolver la transicion correcta.
+const TRANSICION_A_ETAPA = {
+  "area_carga->bodega_origen": "Espera de Ruta",
+  "area_descarga->bodega_destino": "Fin de Entrega de Mercadería",
+};
+
+function etapaParaTransicion(zonaAnterior, zonaNueva) {
+  const clave = `${zonaAnterior}->${zonaNueva}`;
+  if (TRANSICION_A_ETAPA[clave]) return TRANSICION_A_ETAPA[clave];
+  // Salir de bodega_destino/area_descarga hacia "en_ruta" es el viaje terminando (se aleja del
+  // cliente destino), no "otra vez en camino" -- no tiene sentido reabrir "En Ruta Destino" ahi. Se
+  // cierra lo que estaba abierto sin abrir nada nuevo; trip.status=FINISHED (Pasada 2) termina de
+  // marcar el viaje como completado poco despues.
+  if (["bodega_destino", "area_descarga"].includes(zonaAnterior) && zonaNueva === "en_ruta") return null;
+  return ZONA_TO_ETAPA[zonaNueva] ?? null;
+}
+
 // "Asignación Unidad" no depende de Satrack -- basta con que el ticket tenga Placa Unidad en
 // Airtable (que es justo cuando se crea la fila en viajes, exitosa o con error). Se abre una sola
 // vez por viaje; la cierra cerrarYAbrirEtapa() cuando se detecte la entrada real a bodega_origen.
@@ -490,11 +511,9 @@ async function asegurarEtapaInicial(viajeId, ticketId) {
   });
 }
 
-async function cerrarYAbrirEtapa(viajeId, ticketId, zonaNueva) {
+async function cerrarYAbrirEtapa(viajeId, ticketId, etapaNombre) {
   await cerrarEtapaAbierta(viajeId);
-
-  const etapaNombre = ZONA_TO_ETAPA[zonaNueva];
-  if (!etapaNombre) return; // "sin_asignar" u otra zona sin etapa asociada
+  if (!etapaNombre) return; // transicion sin etapa asociada (ej. viaje terminando)
   await supabase.from("etapas").insert({
     viaje_id: viajeId,
     ticket_id: ticketId,
@@ -562,7 +581,7 @@ async function pasadaAsignacionOrigen(eventsToken) {
       // aplica todavia en esta etapa (el viaje ni siquiera ha arrancado en Satrack), solo interesan
       // los dos poligonos de origen.
       if (zonaDetectada === "bodega_origen" || zonaDetectada === "area_carga") {
-        await cerrarYAbrirEtapa(viaje.id, viaje.ticket_id, zonaDetectada);
+        await cerrarYAbrirEtapa(viaje.id, viaje.ticket_id, etapaParaTransicion(viaje.zona_actual, zonaDetectada));
         await supabase.from("viajes").update({ zona_actual: zonaDetectada }).eq("id", viaje.id);
         ok++;
       }
@@ -628,7 +647,7 @@ async function pasada2RevisarEtapas(token) {
       const zonaNueva = detectarZona(toFeature(coordinate), areas);
 
       if (zonaNueva !== viaje.zona_actual) {
-        await cerrarYAbrirEtapa(viaje.id, viaje.ticket_id, zonaNueva);
+        await cerrarYAbrirEtapa(viaje.id, viaje.ticket_id, etapaParaTransicion(viaje.zona_actual, zonaNueva));
         await supabase.from("viajes").update({ zona_actual: zonaNueva }).eq("id", viaje.id);
       }
       ok++;
