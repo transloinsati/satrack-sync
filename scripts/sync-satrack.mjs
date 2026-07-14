@@ -602,6 +602,88 @@ async function pasadaAsignacionOrigen(eventsToken) {
   console.log(`Pasada asignación origen: ${ok} con cambio de zona, ${error} con error de ${viajesSinAsignar.length} viajes sin asignar.`);
 }
 
+// Pasada de recuperación — un viaje puede quedar zona_actual='cancelado' (trip EXPIRED/CANCELLED
+// en Satrack) mientras el ticket real sigue "En proceso" en Airtable: se perdió el rastreo, pero el
+// envío físico puede seguir en curso. No basta con mirar Airtable para decidir si reintentar
+// SendTrips -- Airtable puede estar simplemente sin actualizar (nadie cerró el ticket todavía)
+// aunque el camión ya haya entregado. Se usa la posición real (API de eventos) contra las Areas de
+// destino: si el camión ya está ahí, se asume entregado (no se reintenta, evita un viaje fantasma
+// en Satrack); si sigue lejos, se reactiva para que la Pasada 1 vuelva a intentar en esta misma
+// corrida.
+async function pasadaRecuperarCancelados(eventsToken) {
+  const { data: cancelados } = await supabase
+    .from("viajes")
+    .select("*")
+    .eq("zona_actual", "cancelado")
+    .eq("estado_envio", "enviado");
+  if (!cancelados?.length) return;
+
+  const allAreas = await airtableListAll("Areas");
+
+  let reactivados = 0;
+  let confirmadosCompletos = 0;
+  let error = 0;
+  const detalle = [];
+
+  for (const viaje of cancelados) {
+    try {
+      const ticket = await airtableGetRecord(TICKETS_TABLE, viaje.airtable_record_id);
+      if (ticket.fields["Estado Ticket"] !== "En proceso") continue; // Airtable ya lo cerró, nada que hacer
+
+      if (!eventsToken) continue; // sin API de eventos no se puede confirmar posición -> no reintentar a ciegas
+
+      const loc = await getLastLocation(eventsToken, viaje.placa_unidad);
+      if (!loc) continue; // sin dato de ubicación todavia
+
+      const destinoRecordId = ticket.fields["Destino 2"]?.[0];
+      const destinoRecord = destinoRecordId ? await airtableGetRecord("Destino", destinoRecordId) : null;
+      const clienteDestinoId = destinoRecord?.fields["Cliente Destino"]?.[0];
+      const areas = areasFor(allAreas, null, clienteDestinoId); // solo interesan las de destino aqui
+      const point = { type: "Feature", geometry: { type: "Point", coordinates: [loc.longitude, loc.latitude] } };
+      const zonaDetectada = detectarZona(point, areas);
+
+      if (zonaDetectada === "bodega_destino" || zonaDetectada === "area_descarga") {
+        // Ya esta en destino -- lo mas probable es que ya se entrego y Satrack solo perdio el trip
+        // antes de reportar FINISHED. No reintentar SendTrips (crearia un viaje fantasma en Satrack
+        // para un envio que ya terminó).
+        await supabase.from("viajes").update({ zona_actual: "completado" }).eq("id", viaje.id);
+        confirmadosCompletos++;
+      } else {
+        // Sigue lejos del destino -- el envio real probablemente sigue en curso, solo se perdió el
+        // rastreo. Se reactiva (estado_envio vuelve a 'error') para que la Pasada 1, en esta misma
+        // corrida, intente un SendTrips nuevo.
+        // zona_actual vuelve a 'sin_asignar' (no se deja en 'cancelado', que es terminal -- si no
+        // se resetea, la Pasada 2 nunca vuelve a rastrear el viaje nuevo aunque SendTrips funcione).
+        await supabase
+          .from("viajes")
+          .update({
+            estado_envio: "error",
+            error_mensaje: "Viaje anterior quedó cancelado/expirado en Satrack sin llegar a destino — reintentando SendTrips",
+            satrack_trip_id: null,
+            zona_actual: "sin_asignar",
+          })
+          .eq("id", viaje.id);
+        reactivados++;
+      }
+    } catch (err) {
+      error++;
+      detalle.push({ ticket_id: viaje.ticket_id, error: err.message });
+    }
+  }
+
+  await supabase.from("log_sincronizacion").insert({
+    pasada: "recuperar_cancelados",
+    tickets_procesados: cancelados.length,
+    tickets_ok: reactivados + confirmadosCompletos,
+    tickets_error: error,
+    detalle,
+  });
+
+  console.log(
+    `Pasada recuperar cancelados: ${reactivados} reactivados, ${confirmadosCompletos} confirmados como completados, ${error} con error de ${cancelados.length} revisados.`
+  );
+}
+
 async function pasada2RevisarEtapas(token) {
   const { data: viajesActivos } = await supabase
     .from("viajes")
@@ -672,10 +754,10 @@ async function pasada2RevisarEtapas(token) {
 
 async function main() {
   const token = await getSatrackToken();
-  await pasada1CrearViajes(token);
 
-  // Credenciales de la API de eventos son opcionales -- si fallan o no estan puestas, se salta esta
-  // deteccion temprana sin tumbar el resto del sync.
+  // Credenciales de la API de eventos son opcionales -- si fallan o no estan puestas, se saltan las
+  // pasadas que dependen de ella sin tumbar el resto del sync. Se obtiene ANTES de la Pasada 1 para
+  // que un ticket reactivado por pasadaRecuperarCancelados alcance a procesarse en la misma corrida.
   let eventsToken = null;
   if (SATRACK_EVENTS_CLIENT_ID && SATRACK_EVENTS_CLIENT_SECRET) {
     try {
@@ -684,8 +766,9 @@ async function main() {
       console.warn(`No se pudo autenticar con la API de eventos de ubicación: ${err.message}`);
     }
   }
+  await pasadaRecuperarCancelados(eventsToken);
+  await pasada1CrearViajes(token);
   await pasadaAsignacionOrigen(eventsToken);
-
   await pasada2RevisarEtapas(token);
 }
 
