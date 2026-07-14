@@ -1,5 +1,6 @@
 // Sync Airtable (Tickets/Origen/Destino/Clientes/Areas, solo lectura) <-> Satrack (SendTrips +
-// GetEventsOnRouteByVehicleFromBitacora) <-> Supabase (viajes/etapas/log_sincronizacion, escritura).
+// GetEventsOnRouteByVehicleFromBitacora + API de eventos de ubicación) <-> Supabase
+// (viajes/etapas/log_sincronizacion, escritura).
 //
 // Uso local: node scripts/sync-satrack.mjs
 // Uso en cron (servidor Transloinsa / GitHub Actions): mismo comando, variables de entorno vía .env
@@ -18,6 +19,14 @@ const {
   // Sobreescribir via env si Satrack confirma un host distinto para las credenciales de TMS.
   SATRACK_TOKEN_URL = "http://securityprovider.satrack.com:8080/auth/realms/satrack-base/protocol/openid-connect/token",
   SATRACK_API_BASE = "https://trafficcontrolintegrationapi.satrack.com",
+  // Credenciales del producto "API de eventos de ubicación" (distinto del TMS/rutas de arriba) --
+  // dan la posición cruda de una placa sin necesidad de que exista un viaje/trip en Satrack. Se usan
+  // para detectar "Asignación Unidad" -> "Llegada Cliente Origen" antes de que SendTrips se haya
+  // podido hacer (ej. ticket sin Destino todavia) o antes de que el trip empiece a reportar. Opcional
+  // -- si faltan, esa detección temprana simplemente se salta sin romper el resto del script.
+  SATRACK_EVENTS_CLIENT_ID,
+  SATRACK_EVENTS_CLIENT_SECRET,
+  SATRACK_EVENTS_API_BASE = "http://locationintegrationapi.satrack.com",
   AIRTABLE_PAT,
   AIRTABLE_BASE_ID,
   SUPABASE_URL,
@@ -139,12 +148,8 @@ function areasFor(allAreas, clienteOrigenId, clienteDestinoId) {
 // Satrack — autenticacion + SendTrips (Pasada 1) + GetEventsOnRouteByVehicleFromBitacora (Pasada 2)
 // ---------------------------------------------------------------------------
 
-async function getSatrackToken() {
-  const body = new URLSearchParams({
-    client_id: SATRACK_CLIENT_ID,
-    client_secret: SATRACK_CLIENT_SECRET,
-    grant_type: SATRACK_GRANT_TYPE,
-  });
+async function getToken(clientId, clientSecret) {
+  const body = new URLSearchParams({ client_id: clientId, client_secret: clientSecret, grant_type: SATRACK_GRANT_TYPE });
   const res = await fetch(SATRACK_TOKEN_URL, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -153,6 +158,24 @@ async function getSatrackToken() {
   if (!res.ok) throw new Error(`Satrack token -> ${res.status}: ${await res.text()}`);
   const { access_token } = await res.json();
   return access_token;
+}
+
+const getSatrackToken = () => getToken(SATRACK_CLIENT_ID, SATRACK_CLIENT_SECRET);
+const getSatrackEventsToken = () => getToken(SATRACK_EVENTS_CLIENT_ID, SATRACK_EVENTS_CLIENT_SECRET);
+
+// API de eventos de ubicacion (producto distinto al TMS) -- da la posicion cruda de una placa sin
+// depender de que exista un viaje en Satrack. GraphQL, un solo query "last".
+async function getLastLocation(token, placa) {
+  const placaEscapada = placa.replace(/["\\]/g, "");
+  const query = `{ last(serviceCodes: ["${placaEscapada}"]) { serviceCode latitude longitude generationDate } }`;
+  const res = await fetch(`${SATRACK_EVENTS_API_BASE}/api/location`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ query }),
+  });
+  if (!res.ok) throw new Error(`Satrack eventos ubicacion -> ${res.status}: ${await res.text()}`);
+  const json = await res.json();
+  return json?.data?.last?.[0] ?? null;
 }
 
 async function satrackFetch(token, path, options = {}) {
@@ -347,39 +370,49 @@ async function pasada1CrearViajes(token) {
         startWarning = `SendTrips OK pero ManualStart falló: ${startErr.message}`;
       }
 
-      await supabase.from("viajes").upsert(
-        {
-          ticket_id: ticketId,
-          airtable_record_id: ticket.id,
-          placa_unidad: unidad.placa,
-          cliente: origenResult.cliente.fields["Razón Social"],
-          origen_nombre: origenResult.origen.fields.Name,
-          origen_lat: origenResult.lat,
-          origen_lng: origenResult.lng,
-          destino_nombre: destinoResult.destino.fields["Cliente Entrega"],
-          destino_lat: destinoResult.lat,
-          destino_lng: destinoResult.lng,
-          satrack_correlation_id: body?.correlationId ?? null,
-          satrack_trip_id: tripId,
-          estado_envio: "enviado",
-          error_mensaje: startWarning,
-        },
-        { onConflict: "ticket_id" }
-      );
+      const { data: viajeRow } = await supabase
+        .from("viajes")
+        .upsert(
+          {
+            ticket_id: ticketId,
+            airtable_record_id: ticket.id,
+            placa_unidad: unidad.placa,
+            cliente: origenResult.cliente.fields["Razón Social"],
+            origen_nombre: origenResult.origen.fields.Name,
+            origen_lat: origenResult.lat,
+            origen_lng: origenResult.lng,
+            destino_nombre: destinoResult.destino.fields["Cliente Entrega"],
+            destino_lat: destinoResult.lat,
+            destino_lng: destinoResult.lng,
+            satrack_correlation_id: body?.correlationId ?? null,
+            satrack_trip_id: tripId,
+            estado_envio: "enviado",
+            error_mensaje: startWarning,
+          },
+          { onConflict: "ticket_id" }
+        )
+        .select("id")
+        .single();
+      if (viajeRow) await asegurarEtapaInicial(viajeRow.id, ticketId);
       ok++;
     } catch (err) {
       error++;
       detalle.push({ ticket_id: ticketId, error: err.message });
-      await supabase.from("viajes").upsert(
-        {
-          ticket_id: ticketId,
-          airtable_record_id: ticket.id,
-          placa_unidad: ticket.fields["Copia de Placa Unidad"] || "desconocida",
-          estado_envio: "error",
-          error_mensaje: err.message,
-        },
-        { onConflict: "ticket_id" }
-      );
+      const { data: viajeRow } = await supabase
+        .from("viajes")
+        .upsert(
+          {
+            ticket_id: ticketId,
+            airtable_record_id: ticket.id,
+            placa_unidad: ticket.fields["Copia de Placa Unidad"] || "desconocida",
+            estado_envio: "error",
+            error_mensaje: err.message,
+          },
+          { onConflict: "ticket_id" }
+        )
+        .select("id")
+        .single();
+      if (viajeRow) await asegurarEtapaInicial(viajeRow.id, ticketId);
     }
   }
 
@@ -436,6 +469,21 @@ const ZONA_TO_ETAPA = {
   area_descarga: "Recepción de Mercadería",
 };
 
+// "Asignación Unidad" no depende de Satrack -- basta con que el ticket tenga Placa Unidad en
+// Airtable (que es justo cuando se crea la fila en viajes, exitosa o con error). Se abre una sola
+// vez por viaje; la cierra cerrarYAbrirEtapa() cuando se detecte la entrada real a bodega_origen.
+async function asegurarEtapaInicial(viajeId, ticketId) {
+  const { data: existe } = await supabase.from("etapas").select("id").eq("viaje_id", viajeId).limit(1).maybeSingle();
+  if (existe) return;
+  await supabase.from("etapas").insert({
+    viaje_id: viajeId,
+    ticket_id: ticketId,
+    etapa: "Asignación Unidad",
+    fecha_inicio: new Date().toISOString(),
+    estado_evento: "En Proceso",
+  });
+}
+
 async function cerrarYAbrirEtapa(viajeId, ticketId, zonaNueva) {
   await cerrarEtapaAbierta(viajeId);
 
@@ -474,6 +522,60 @@ const TRIP_STATUS_TERMINAL = {
   CANCELLED: "cancelado",
   CANCELED: "cancelado",
 };
+
+// Pasada intermedia — detecta "Llegada Cliente Origen"/"Proceso Carga" para viajes que todavia
+// estan en zona_actual='sin_asignar' (sin viaje en Satrack todavia, o el viaje no ha empezado a
+// reportar). Usa la API de eventos de ubicacion (posicion cruda por placa, no requiere un "trip")
+// -- por eso corre para TODOS los viajes sin_asignar sin importar si SendTrips tuvo exito o error
+// (ej. ticket sin Destino: la unidad ya esta fisicamente en camino aunque no se le haya podido
+// hacer SendTrips todavia). Opcional: si no hay credenciales de esta API, se salta sin romper nada.
+async function pasadaAsignacionOrigen(eventsToken) {
+  if (!eventsToken) return;
+
+  const { data: viajesSinAsignar } = await supabase.from("viajes").select("*").eq("zona_actual", "sin_asignar");
+  if (!viajesSinAsignar?.length) return;
+
+  const allAreas = await airtableListAll("Areas");
+
+  let ok = 0;
+  let error = 0;
+  const detalle = [];
+
+  for (const viaje of viajesSinAsignar) {
+    try {
+      const loc = await getLastLocation(eventsToken, viaje.placa_unidad);
+      if (!loc) continue; // sin evento de ubicacion todavia para esta placa
+
+      const ticket = await airtableGetRecord(TICKETS_TABLE, viaje.airtable_record_id);
+      const clienteOrigenId = ticket.fields["RUC Cliente"]?.[0];
+      const areas = areasFor(allAreas, clienteOrigenId, null); // solo interesan las de origen aqui
+      const point = { type: "Feature", geometry: { type: "Point", coordinates: [loc.longitude, loc.latitude] } };
+      const zonaDetectada = detectarZona(point, areas);
+
+      // detectarZona() cae en "en_ruta" por defecto si no esta dentro de ningun poligono -- eso no
+      // aplica todavia en esta etapa (el viaje ni siquiera ha arrancado en Satrack), solo interesan
+      // los dos poligonos de origen.
+      if (zonaDetectada === "bodega_origen" || zonaDetectada === "area_carga") {
+        await cerrarYAbrirEtapa(viaje.id, viaje.ticket_id, zonaDetectada);
+        await supabase.from("viajes").update({ zona_actual: zonaDetectada }).eq("id", viaje.id);
+        ok++;
+      }
+    } catch (err) {
+      error++;
+      detalle.push({ ticket_id: viaje.ticket_id, error: err.message });
+    }
+  }
+
+  await supabase.from("log_sincronizacion").insert({
+    pasada: "asignacion_origen",
+    tickets_procesados: viajesSinAsignar.length,
+    tickets_ok: ok,
+    tickets_error: error,
+    detalle,
+  });
+
+  console.log(`Pasada asignación origen: ${ok} con cambio de zona, ${error} con error de ${viajesSinAsignar.length} viajes sin asignar.`);
+}
 
 async function pasada2RevisarEtapas(token) {
   const { data: viajesActivos } = await supabase
@@ -546,6 +648,19 @@ async function pasada2RevisarEtapas(token) {
 async function main() {
   const token = await getSatrackToken();
   await pasada1CrearViajes(token);
+
+  // Credenciales de la API de eventos son opcionales -- si fallan o no estan puestas, se salta esta
+  // deteccion temprana sin tumbar el resto del sync.
+  let eventsToken = null;
+  if (SATRACK_EVENTS_CLIENT_ID && SATRACK_EVENTS_CLIENT_SECRET) {
+    try {
+      eventsToken = await getSatrackEventsToken();
+    } catch (err) {
+      console.warn(`No se pudo autenticar con la API de eventos de ubicación: ${err.message}`);
+    }
+  }
+  await pasadaAsignacionOrigen(eventsToken);
+
   await pasada2RevisarEtapas(token);
 }
 
