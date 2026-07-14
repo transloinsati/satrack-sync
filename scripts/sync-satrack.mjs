@@ -321,10 +321,16 @@ async function pasada1CrearViajes(token) {
   for (const ticket of tickets) {
     const ticketId = ticket.fields["Id Ticket"];
     try {
+      // Se busca por airtable_record_id, NO por ticket_id -- "Id Ticket" es una formula que puede
+      // cambiar de valor en cualquier momento (usa Documento de Transporte si esta lleno, si no
+      // genera "YYYYMMDD-TCxxx"). airtable_record_id es el identificador real, inmutable, de
+      // Airtable. Usar ticket_id aqui causo un SendTrips duplicado real en produccion (mismo ticket,
+      // dos viajes en Satrack) el 2026-07-13 cuando alguien llenó Documento de Transporte a mitad
+      // de camino.
       const { data: existing } = await supabase
         .from("viajes")
         .select("estado_envio")
-        .eq("ticket_id", ticketId)
+        .eq("airtable_record_id", ticket.id)
         .maybeSingle();
       if (existing?.estado_envio === "enviado") continue; // ya se le hizo SendTrips
 
@@ -389,7 +395,7 @@ async function pasada1CrearViajes(token) {
             estado_envio: "enviado",
             error_mensaje: startWarning,
           },
-          { onConflict: "ticket_id" }
+          { onConflict: "airtable_record_id" }
         )
         .select("id")
         .single();
@@ -408,7 +414,7 @@ async function pasada1CrearViajes(token) {
             estado_envio: "error",
             error_mensaje: err.message,
           },
-          { onConflict: "ticket_id" }
+          { onConflict: "airtable_record_id" }
         )
         .select("id")
         .single();
