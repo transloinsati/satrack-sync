@@ -445,6 +445,54 @@ function toFeature([lat, lng]) {
   return { type: "Feature", geometry: { type: "Point", coordinates: [lng, lat] } };
 }
 
+// Fallback cuando un cliente no tiene Areas calibradas -- sin poligonos, detectarZona() nunca sale
+// de "en_ruta" y las etapas de llegada/descarga/entrega quedan sin poder detectarse aunque el punto
+// (Origen/Destino) si exista. Genera dos circulos genericos centrados en ese punto (misma convencion
+// de radios que se usa como sugerencia al calibrar a mano en el modulo Mapbox: ver
+// documentos_satrack/calibracion_areas_clientes.md). Es puramente en memoria -- no se escribe en
+// Airtable, así la tabla Areas queda solo con calibraciones reales validadas por KMZ/mano. En cuanto
+// alguien calibra Areas de verdad para ese cliente, dejan de generarse estos circulos automaticamente
+// (el llamador solo cae al fallback si areasFor() no encontro ninguna Area real para ese cliente).
+const RADIO_FALLBACK_GENERAL = 180; // ~101,788 m^2
+const RADIO_FALLBACK_ESPECIFICO = 60; // ~11,310 m^2
+
+function makeCirclePolygon(lat, lng, radiusMeters, numSides = 32) {
+  const R = 6378137;
+  const lat0 = (lat * Math.PI) / 180;
+  const coords = [];
+  for (let i = 0; i <= numSides; i++) {
+    const angle = (i / numSides) * 2 * Math.PI;
+    const dLat = ((radiusMeters * Math.cos(angle)) / R) * (180 / Math.PI);
+    const dLng = ((radiusMeters * Math.sin(angle)) / (R * Math.cos(lat0))) * (180 / Math.PI);
+    coords.push([lng + dLng, lat + dLat]);
+  }
+  return { type: "Feature", geometry: { type: "Polygon", coordinates: [coords] }, properties: {} };
+}
+
+function fallbackArea(lat, lng, tipo) {
+  const radio = tipo === AREA_TIPO.BODEGA_DESTINO ? RADIO_FALLBACK_GENERAL : RADIO_FALLBACK_ESPECIFICO;
+  return { fields: { Tipo: tipo, GeoJSON: JSON.stringify(makeCirclePolygon(lat, lng, radio)) } };
+}
+
+// areasFor() + fallback: por cada tipo (bodega_destino/area_descarga) que el cliente NO tenga
+// calibrado de verdad, agrega un circulo generico centrado en el punto propio de ese Destino (siempre
+// disponible, no requiere calibracion -- ver resolveDestino()). Es por tipo, no todo-o-nada -- si el
+// cliente ya tiene, por ejemplo, bodega_destino real pero le falta area_descarga, solo se rellena la
+// que falta y la real calibrada se sigue usando tal cual.
+function areasParaDestinoConFallback(allAreas, clienteDestinoId, destinoRecord) {
+  const areas = areasFor(allAreas, null, clienteDestinoId);
+  if (!clienteDestinoId || destinoRecord?.fields.Latitud == null || destinoRecord?.fields.Longitud == null) {
+    return areas;
+  }
+  const { Latitud: lat, Longitud: lng } = destinoRecord.fields;
+  const tieneTipoReal = (tipo) =>
+    areas.some((a) => a.fields["Cliente_Destino"]?.[0] === clienteDestinoId && normalize(a.fields["Tipo"]) === tipo);
+  const relleno = [AREA_TIPO.BODEGA_DESTINO, AREA_TIPO.AREA_DESCARGA]
+    .filter((tipo) => !tieneTipoReal(tipo))
+    .map((tipo) => fallbackArea(lat, lng, tipo));
+  return areas.concat(relleno);
+}
+
 // Revisa el punto contra las Areas del cliente, priorizando el poligono mas especifico
 // (area_carga/area_descarga) sobre el general (bodega_origen/bodega_destino).
 function detectarZona(point, areas) {
@@ -638,7 +686,7 @@ async function pasadaRecuperarCancelados(eventsToken) {
       const destinoRecordId = ticket.fields["Destino 2"]?.[0];
       const destinoRecord = destinoRecordId ? await airtableGetRecord("Destino", destinoRecordId) : null;
       const clienteDestinoId = destinoRecord?.fields["Cliente Destino"]?.[0];
-      const areas = areasFor(allAreas, null, clienteDestinoId); // solo interesan las de destino aqui
+      const areas = areasParaDestinoConFallback(allAreas, clienteDestinoId, destinoRecord); // solo interesan las de destino aqui
       const point = { type: "Feature", geometry: { type: "Point", coordinates: [loc.longitude, loc.latitude] } };
       const zonaDetectada = detectarZona(point, areas);
 
@@ -725,7 +773,9 @@ async function pasada2RevisarEtapas(token) {
       const destinoRecord = destinoRecordId ? await airtableGetRecord("Destino", destinoRecordId) : null;
       const clienteDestinoId = destinoRecord?.fields["Cliente Destino"]?.[0];
 
-      const areas = areasFor(allAreas, clienteOrigenId, clienteDestinoId);
+      const areas = areasFor(allAreas, clienteOrigenId, null).concat(
+        areasParaDestinoConFallback(allAreas, clienteDestinoId, destinoRecord)
+      );
       const zonaNueva = detectarZona(toFeature(coordinate), areas);
 
       if (zonaNueva !== viaje.zona_actual) {
