@@ -84,21 +84,25 @@ async function airtableListAll(table, params = {}) {
 const normalize = (s) =>
   (s || "").normalize("NFD").replace(/[̀-ͯ]/g, "").trim().toLowerCase();
 
-// Resuelve el Origen (lat/lng) de un ticket via RUC Cliente -> Clientes.Origen, desambiguando por
-// la ciudad de texto del ticket si el cliente tiene mas de un Origen vinculado (ver plan: caso
-// Arcacontinental Duran/Quito). Tickets.Origen 2 (link directo) esta vacio en la practica — no usarlo.
+// Resuelve el Origen (lat/lng) de un ticket. Desde el 2026-09-21 los tickets traen el link directo
+// Tickets."Origen 2" (el punto fisico exacto elegido al crear el ticket) — es la fuente preferida.
+// Respaldo para tickets sin Origen 2: RUC Cliente -> Clientes.Origen, desambiguando por la ciudad de
+// texto del ticket si el cliente tiene mas de un Origen vinculado (caso Arcacontinental Duran/Quito).
+// Ese respaldo fallaba con "ciudad undefined" en cuanto el texto Tickets.Origen dejo de llenarse.
 async function resolveOrigen(ticket) {
   const clienteLink = ticket.fields["RUC Cliente"]?.[0];
   if (!clienteLink) return { error: "Ticket sin RUC Cliente vinculado" };
 
   const cliente = await airtableGetRecord("Clientes", clienteLink);
   const origenLinks = cliente.fields["Origen"] || [];
-  if (origenLinks.length === 0) {
+
+  const origenDirecto = ticket.fields["Origen 2"]?.[0];
+  if (!origenDirecto && origenLinks.length === 0) {
     return { error: `Cliente "${cliente.fields["Razón Social"]}" no tiene Origen calibrado` };
   }
 
-  let origenRecordId = origenLinks[0];
-  if (origenLinks.length > 1) {
+  let origenRecordId = origenDirecto || origenLinks[0];
+  if (!origenDirecto && origenLinks.length > 1) {
     const ciudadTicket = normalize(ticket.fields["Origen"]);
     const origenes = await Promise.all(origenLinks.map((id) => airtableGetRecord("Origen", id)));
     const match = origenes.find((o) =>
