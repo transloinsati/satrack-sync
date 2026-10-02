@@ -324,6 +324,8 @@ async function pasada1CrearViajes(token) {
 
   for (const ticket of tickets) {
     const ticketId = ticket.fields["Id Ticket"];
+    // Datos del origen ya resueltos, para no perderlos en la fila de error si algo falla despues.
+    let origenInfo = {};
     try {
       // Se busca por airtable_record_id, NO por ticket_id -- "Id Ticket" es una formula que puede
       // cambiar de valor en cualquier momento (usa Documento de Transporte si esta lleno, si no
@@ -355,6 +357,12 @@ async function pasada1CrearViajes(token) {
 
       const origenResult = await resolveOrigen(ticket);
       if (origenResult.error) throw new Error(origenResult.error);
+      origenInfo = {
+        cliente: origenResult.cliente.fields["Razón Social"],
+        origen_nombre: origenResult.origen.fields.Name,
+        origen_lat: origenResult.lat,
+        origen_lng: origenResult.lng,
+      };
       const destinoResult = await resolveDestino(ticket);
       if (destinoResult.error) throw new Error(destinoResult.error);
 
@@ -415,6 +423,7 @@ async function pasada1CrearViajes(token) {
             ticket_id: ticketId,
             airtable_record_id: ticket.id,
             placa_unidad: ticket.fields["Copia de Placa Unidad"] || "desconocida",
+            ...origenInfo,
             estado_envio: "error",
             error_mensaje: err.message,
           },
